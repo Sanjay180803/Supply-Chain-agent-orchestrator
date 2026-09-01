@@ -1,0 +1,5 @@
+langgraph
+langchain
+requests
+pydantic
+langchain-anthropic
