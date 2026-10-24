@@ -1,18 +1,30 @@
 import json
+import os
 import uuid
-from fastapi import FastAPI
-import future
-from pydantic import BaseModel
-from kafka import KafkaProducer
+
 import redis
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 app = FastAPI(title="Supply Chain Gateway")
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
-    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-)
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+_producer = None
+
+
+def get_producer():
+    global _producer
+    if _producer is None:
+        from kafka import KafkaProducer
+
+        _producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+    return _producer
 
 REQUEST_TOPIC = "supply-chain-requests"
 
@@ -25,13 +37,15 @@ class GatewayRequest(BaseModel):
 def submit(req: GatewayRequest):
     request_id = str(uuid.uuid4())
     payload = {"request_id": request_id, "request": req.request}
-    future = producer.send(REQUEST_TOPIC, payload)
-    try:
-        future.get(timeout=10)
-    except Exception as e:
-        return {"error": f"Failed to publish to Kafka: {e}"}
-    producer.flush()
+    # Record the status before publishing. Setting it afterwards raced with
+    # fast workers: a worker could finish and write "done", and then this
+    # line overwrote it with "queued", so the client polled until timeout.
     r.set(f"status:{request_id}", "queued", ex=300)
+    try:
+        get_producer().send(REQUEST_TOPIC, payload).get(timeout=10)
+    except Exception as e:
+        r.delete(f"status:{request_id}")
+        return {"error": f"Failed to publish to Kafka: {e}"}
     return {"request_id": request_id, "status": "queued"}
 
 
