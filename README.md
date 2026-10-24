@@ -1,5 +1,7 @@
 # Multi-Agent Supply Chain Orchestrator
 
+![Tests](https://github.com/Sanjay180803/Supply-Chain-agent-orchestrator/actions/workflows/tests.yml/badge.svg)
+
 A distributed, multi-agent supply chain platform built to explore production-grade patterns in agentic AI systems: multi-agent coordination, protocol standardization (MCP, A2A), distributed systems correctness under concurrent load, and evaluation/drift monitoring.
 
 Four specialized LangGraph agents — **procurement**, **logistics**, **compliance**, and **analytics** — coordinate through a Kafka-queued orchestrator with Redis-backed admission control, communicate via the Model Context Protocol (MCP) and Agent2Agent (A2A) protocol, and are continuously monitored via an eval/drift pipeline.
@@ -63,23 +65,29 @@ Each agent is a standalone LangGraph workflow with a distinct shape:
 
 ## Key engineering findings
 
-This project was built iteratively with real production-style debugging, not a clean happy-path build. Two findings worth calling out:
-
 ### 1. Kafka at-least-once delivery caused duplicate task processing
 
-Under sustained load, Kafka consumer group rebalances (triggered when a slow LLM-bound `poll()` cycle missed a heartbeat) caused the same message to be redelivered to multiple orchestrator replicas. Since redelivery happened *after* successful processing but *before* offset commit, this created a duplicate-credit-consumption risk in the admission control layer — directly analogous to a distributed double-spend bug.
+Under sustained load, consumer-group rebalances (triggered when a slow, LLM-bound processing cycle missed a heartbeat) redelivered messages to other orchestrator replicas after they had been processed but before the offset was committed. Without a guard, the same request would run twice and consume two credits.
 
-**Fix:** a Redis `SETNX`-based idempotency guard (`already_processing_or_done()`) claims each `request_id` atomically before processing begins. Only the first delivery of a given task actually executes; redelivered duplicates are detected and skipped. Verified via load testing: budget correctly returned to full capacity (5/5) after a run that included multiple observed rebalances, with zero credit leakage.
+**Fix:** each `request_id` has a Redis claim: `processing:<replica>` with a lease, or `done`. A redelivered message whose request is `done` is skipped; one whose request is still being processed waits for that claim to finish or expire. A failed attempt releases its claim so the redelivery retries it; a crashed attempt's claim expires.
 
-### 2. Admission control under concurrent load
+The resulting guarantee is **at-least-once delivery with idempotent completion**: each request completes once even when delivered several times. It is not exactly-once execution: an attempt that crashes part way may already have made LLM or agent calls before the retry.
 
-A Redis-backed atomic credit system (mirroring an exactly-once distributed admission pattern) gates concurrent LLM calls across orchestrator replicas, preventing the request rate from exceeding a configured budget regardless of how many replicas are running. Verified via Locust and custom load tests: budget never went negative or above its ceiling across 15+ concurrent requests against a 5-credit budget, even through consumer rebalances and redeliveries.
+### 2. Admission control across replicas
+
+LLM-bound work is capped at `MAX_CONCURRENT_CALLS` (default 5) across all replicas. Each in-flight request holds a **leased credit** in a Redis sorted set; acquiring is a single Lua script that drops expired leases and grants a credit only below the cap. A replica that dies without releasing loses nothing permanently: its credit returns when the lease expires (default 300 s, matching `max_poll_interval_ms`).
+
+An earlier version used a counter (`DECR`/`INCR`), which lost credits for good when a replica died mid-request, and could exceed the cap if the budget was re-initialized while requests were in flight.
+
+**Verified by tests** (`tests/`, run in CI against Redis): 60 concurrent acquisitions against 5 credits grant exactly 5; a dead holder's credit returns after its lease; three concurrent deliveries of one request run the work once; a failed attempt is retried and completes.
 
 ## Load test results
 
-Median end-to-end latency (full procurement + logistics coordination, including multi-round LLM negotiation): **~59s**, consistent across two independent test runs (n=4 and n=82 samples).
+These numbers come from runs against the Anthropic API; the raw logs are not committed. Re-run `orchestrator/load_test.py` and `eval/run_eval_metrics.py` to reproduce them.
 
-Per-agent latency (from the eval harness, n=72 total logged executions):
+Median end-to-end latency for one workload — a single request that needs procurement (multi-round LLM negotiation) and logistics: **~59 s** (two runs, n = 4 and n = 82).
+
+Per-agent latency from the eval harness (n = 72 logged executions in total). Each agent does a different amount of LLM work, so these are not comparable to each other:
 
 | Agent | p50 latency | p95 latency | Success rate |
 |---|---|---|---|
@@ -115,9 +123,9 @@ cd infra
 docker-compose up -d
 ```
 
-### 2. Seed the dataset
+### 2. Seed and serve the dataset
+From the repository root (the dataset service is `main.py`, `models.py`, `generate_data.py`):
 ```bash
-cd dataset_service
 pip install -r requirements.txt
 python generate_data.py
 python -m uvicorn main:app --port 8000
@@ -150,10 +158,15 @@ cd agents/analytics   && python a2a_server.py   # port 8205
 ### 6. Start the Kafka-based orchestration layer (optional, for distributed dispatch)
 ```bash
 cd orchestrator
-python init_budget.py
-python worker.py   # run 2-3 times with different REPLICA_ID env vars
+pip install -r requirements.txt
+python create_topic.py --partitions 3        # one partition per replica
+REPLICA_ID=orchestrator-1 python worker.py   # repeat in 3 terminals with different IDs
+```
+In another terminal, from the repository root:
+```bash
 cd gateway && python -m uvicorn main:app --port 8005
 ```
+Hosts are configurable with `REDIS_URL`, `KAFKA_BOOTSTRAP` and `REGISTRY_URL`.
 
 ### 7. Send a request via A2A
 ```bash
@@ -169,17 +182,29 @@ python run_eval_metrics.py
 python drift_monitor.py
 ```
 
+## Tests
+
+```bash
+pip install redis requests pytest fastapi httpx pydantic
+REDIS_URL=redis://localhost:6379/15 pytest tests -v
+```
+
+Admission, claim, worker and gateway tests run against a real Redis with intent classification and agent calls stubbed, so they need no API key and make no paid calls. CI runs them on every pull request.
+
 ## Project structure
 
 ```
-dataset_service/       # FastAPI service serving synthetic supply-chain data
+main.py, models.py,
+generate_data.py      # dataset service: FastAPI over synthetic supply-chain data
 agents/
   procurement/          # negotiation agent (LangGraph + MCP + A2A)
   logistics/             # carrier selection agent
   compliance/            # policy validation agent
   analytics/             # aggregation agent
 registry/                # agent discovery service
-orchestrator/            # Kafka consumer + Redis admission control
+orchestrator/            # Kafka consumer, Redis admission control, topic setup
+gateway/                 # submit/poll API in front of Kafka
+tests/                   # admission, idempotency, worker and gateway tests
 mcp_servers/             # MCP tool servers per agent
 infra/                   # Docker Compose (Kafka, Redis)
 eval/                    # eval metrics + drift monitoring
@@ -190,5 +215,5 @@ load_tests/              # Locust load test
 
 - Multi-agent coordination with distinct, non-trivial workflow shapes (negotiation, ranking, validation, aggregation)
 - Standardized agent protocols (MCP for tool access, A2A for agent-to-agent communication) rather than ad-hoc HTTP calls
-- Distributed systems correctness under real failure conditions (consumer rebalances, at-least-once delivery, concurrent admission control)
+- Distributed systems correctness under failure (consumer rebalances, at-least-once delivery with idempotent completion, leased admission credits), covered by tests
 - Production discipline: load testing, structured evaluation, and drift monitoring — with honest treatment of each tool's limitations
