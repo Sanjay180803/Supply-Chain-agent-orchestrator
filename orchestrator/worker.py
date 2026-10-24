@@ -2,19 +2,25 @@ import json
 import os
 import time
 import requests
-from kafka import KafkaConsumer
-from kafka.errors import CommitFailedError, KafkaError
-import redis
-from langchain_anthropic import ChatAnthropic
 
-from admission import acquire_credit, release_credit, init_budget, already_processing_or_done
+import admission
+from admission import acquire_credit, mark_done, release_claim, release_credit, wait_for_claim
 
 REPLICA_ID = os.getenv("REPLICA_ID", "orchestrator-0")
-REGISTRY_URL = "http://localhost:8001"
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8001")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 REQUEST_TOPIC = "supply-chain-requests"
 
-llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+_llm = None
+
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        from langchain_anthropic import ChatAnthropic
+
+        _llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
+    return _llm
 
 
 def classify_intent(text: str) -> list[str]:
@@ -25,7 +31,7 @@ def classify_intent(text: str) -> list[str]:
 Return ONLY a JSON list, e.g. ["procurement"] or ["procurement", "logistics"].
 
 Request: {text}"""
-    response = llm.invoke(prompt)
+    response = get_llm().invoke(prompt)
     content = response.content.strip().strip("`")
     if content.startswith("json"):
         content = content[4:]
@@ -47,19 +53,26 @@ def dispatch(agent: dict, raw_request: str) -> dict:
     return resp.json()
 
 
-def process_request(request_id: str, raw_request: str):
-    if already_processing_or_done(request_id):
+def process_request(request_id: str, raw_request: str) -> str:
+    """Process one delivery of a request. Returns "done" (completed now),
+    "duplicate" (already completed by an earlier delivery) or
+    "rejected" (no capacity). Raises if processing failed, after releasing
+    the claim so a redelivery can retry."""
+    r = admission.client()
+    if wait_for_claim(request_id, REPLICA_ID) == "done":
         print(f"[{REPLICA_ID}] Skipping duplicate delivery of {request_id}")
-        return
+        return "duplicate"
 
     print(f"[{REPLICA_ID}] Processing {request_id}")
     r.set(f"status:{request_id}", "processing", ex=300)
 
-    if not acquire_credit(timeout_seconds=15.0):
-        r.set(f"status:{request_id}", "done", ex=300)
+    holder = acquire_credit(f"{REPLICA_ID}:{request_id}", timeout_seconds=15.0)
+    if holder is None:
         r.set(f"result:{request_id}", json.dumps({"error": "admission timeout — system at capacity"}), ex=300)
+        r.set(f"status:{request_id}", "done", ex=300)
+        mark_done(request_id)
         print(f"[{REPLICA_ID}] Admission timeout for {request_id}")
-        return
+        return "rejected"
 
     try:
         intents = classify_intent(raw_request)
@@ -74,15 +87,26 @@ def process_request(request_id: str, raw_request: str):
         final_result = {"intents": intents, "results": results, "handled_by": REPLICA_ID}
         r.set(f"result:{request_id}", json.dumps(final_result), ex=300)
         r.set(f"status:{request_id}", "done", ex=300)
+        mark_done(request_id)
         print(f"[{REPLICA_ID}] Completed {request_id}")
+        return "done"
+    except Exception:
+        # Without this, the claim would block every redelivery until it
+        # expired and the request would never complete.
+        release_claim(request_id, REPLICA_ID)
+        r.set(f"status:{request_id}", "queued", ex=300)
+        raise
     finally:
-        release_credit()
+        release_credit(holder)
 
 
 def run_consumer_loop():
+    from kafka import KafkaConsumer
+    from kafka.errors import CommitFailedError
+
     consumer = KafkaConsumer(
         REQUEST_TOPIC,
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id="orchestrator-group",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         auto_offset_reset="earliest",
@@ -104,6 +128,8 @@ def run_consumer_loop():
 
 
 def main():
+    from kafka.errors import KafkaError
+
     while True:
         try:
             run_consumer_loop()
